@@ -1,0 +1,87 @@
+# =============================================================
+# TelcoStream — Pipeline Configuration
+# Environment-agnostic. Secrets are NEVER stored here.
+# Databricks reads this at runtime; CI/CD validates it on PR.
+# =============================================================
+
+pipeline:
+  name: telcostream
+  version: "1.0.0"
+
+# ------------------------------------------------------------
+# Streaming settings
+# ------------------------------------------------------------
+streaming:
+  trigger_interval: "30 seconds"       # micro-batch interval
+  checkpoint_base: "/tmp/telcostream/checkpoints"
+  max_files_per_trigger: 1000          # Auto Loader batch size cap
+  bad_records_path: "/tmp/telcostream/dead_letter"
+
+# ------------------------------------------------------------
+# Bronze layer
+# ------------------------------------------------------------
+bronze:
+  input_path: "/tmp/telcostream/raw_events"
+  output_table: "telcostream.bronze.raw_network_events"
+  schema_hints:
+    event_id: "string"
+    event_type: "string"
+    tower_id: "string"
+    region: "string"
+    severity: "string"
+    metric_value: "double"
+    event_timestamp: "timestamp"
+
+# ------------------------------------------------------------
+# Silver layer
+# ------------------------------------------------------------
+silver:
+  fact_table: "telcostream.silver.fact_network_events"
+  dim_tower_table: "telcostream.silver.dim_tower"
+  watermark_delay: "10 minutes"        # tolerate events up to 10 min late
+  dedup_window: "1 hour"               # dedup window for event_id
+
+# ------------------------------------------------------------
+# Gold layer
+# ------------------------------------------------------------
+gold:
+  tower_kpi_table: "telcostream.gold.tower_hourly_kpi"
+  regional_summary_table: "telcostream.gold.regional_drop_summary"
+  kpi_trigger_interval: "5 minutes"   # gold refreshes less frequently
+
+# ------------------------------------------------------------
+# Snowflake connection (credentials injected via Databricks secrets)
+# ------------------------------------------------------------
+snowflake:
+  account_key: "telcostream/snowflake_account"    # Databricks secret key
+  user_key: "telcostream/snowflake_user"
+  password_key: "telcostream/snowflake_password"
+  warehouse: "TELCOSTREAM_WH"
+  database: "TELCOSTREAM"
+  role: "TELCOSTREAM_PIPELINE"
+
+# ------------------------------------------------------------
+# Data generator settings (Phase 2)
+# ------------------------------------------------------------
+generator:
+  output_path: "/tmp/telcostream/raw_events"
+  events_per_second: 10
+  towers:
+    - { id: "TWR-ON-001", name: "Toronto Downtown", region: "Ontario" }
+    - { id: "TWR-ON-002", name: "Hamilton Mountain", region: "Ontario" }
+    - { id: "TWR-ON-003", name: "Mississauga Central", region: "Ontario" }
+    - { id: "TWR-QC-001", name: "Montreal Nord",      region: "Quebec"  }
+    - { id: "TWR-QC-002", name: "Quebec City Est",    region: "Quebec"  }
+    - { id: "TWR-BC-001", name: "Vancouver Harbour",  region: "BC"      }
+  event_types:
+    DROPPED_CALL:    0.40    # 40% of events
+    LATENCY_ALERT:   0.45    # 45% of events
+    TOWER_STATUS:    0.15    # 15% of events
+  severity_weights:
+    LOW:      0.50
+    MEDIUM:   0.30
+    HIGH:     0.15
+    CRITICAL: 0.05
+  anomaly_injection:
+    enabled: true
+    rate: 0.02               # 2% of records are malformed (dead letter testing)
