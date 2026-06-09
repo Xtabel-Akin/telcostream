@@ -1,17 +1,12 @@
 # =============================================================
 # TelcoStream — Snowflake Schema Deploy
+# Uses official snowflakedb/snowflake-cli-action@v2 (not SnowSQL)
 # Triggers: push to main (sql/ changes) or manual dispatch
 #
-# What it does:
-#   1. Installs SnowSQL (Snowflake CLI)
-#   2. Runs snowflake_ddl.sql  (idempotent — safe to rerun)
-#   3. Runs gold_views.sql     (CREATE OR REPLACE — always fresh)
-#
-# Secrets required (set in GitHub → Settings → Secrets):
+# Secrets required (GitHub → Settings → Secrets → Actions):
 #   SNOWFLAKE_ACCOUNT    e.g. abc12345.us-east-1
 #   SNOWFLAKE_USER       your Snowflake username
 #   SNOWFLAKE_PASSWORD   your Snowflake password
-#   SNOWFLAKE_ROLE       ACCOUNTADMIN (for trial) or TELCOSTREAM_PIPELINE
 # =============================================================
 
 name: Deploy Snowflake Schema
@@ -20,8 +15,11 @@ on:
   push:
     branches: [main]
     paths:
-      - "sql/**"              # only fires when SQL files change
-  workflow_dispatch:          # manual trigger from GitHub UI
+      - "sql/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   deploy-schema:
@@ -29,84 +27,78 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
+    env:
+      # Snowflake CLI reads these env vars automatically
+      # Connection name must match what we use in snow sql -c
+      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
+      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_USER:     ${{ secrets.SNOWFLAKE_USER }}
+      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_ROLE:     ACCOUNTADMIN
+      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_WAREHOUSE: TELCOSTREAM_WH
+      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_DATABASE: TELCOSTREAM
+
     steps:
       # --------------------------------------------------------
-      # 1. Checkout repo
+      # 1. Checkout — v4 with Node 24 opt-in to silence warning
       # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       # --------------------------------------------------------
-      # 2. Install SnowSQL
-      # SnowSQL is Snowflake's CLI — used to execute SQL files.
+      # 2. Install Snowflake CLI (official action, replaces SnowSQL)
+      #    v2 installs via uv/pip — no manual binary download
       # --------------------------------------------------------
-      - name: Install SnowSQL
-        run: |
-          curl -O https://sfc-repo.snowflakecomputing.com/snowsql/bootstrap/1.2/linux_x86_64/snowsql-1.2.32-linux_x86_64.bash
-          bash snowsql-1.2.32-linux_x86_64.bash --nox11 -- -b /usr/local/bin/snowsql
-          snowsql --version
+      - name: Install Snowflake CLI
+        uses: snowflakedb/snowflake-cli-action@v2
+        with:
+          cli-version: "3.16"
 
       # --------------------------------------------------------
-      # 3. Configure SnowSQL connection
-      # Writes ~/.snowsql/config with credentials from secrets.
-      # Never hardcode credentials — always use GitHub secrets.
+      # 3. Verify connection before running SQL
+      #    Fails fast here rather than mid-deploy if creds are wrong
       # --------------------------------------------------------
-      - name: Configure SnowSQL
-        run: |
-          mkdir -p ~/.snowsql
-          cat > ~/.snowsql/config << EOF
-          [connections.telcostream]
-          accountname = ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          username    = ${{ secrets.SNOWFLAKE_USER }}
-          password    = ${{ secrets.SNOWFLAKE_PASSWORD }}
-          rolename    = ${{ secrets.SNOWFLAKE_ROLE }}
-          warehousename = TELCOSTREAM_WH
-          dbname      = TELCOSTREAM
-          EOF
+      - name: Test Snowflake connection
+        run: snow connection test -c telcostream
 
       # --------------------------------------------------------
-      # 4. Deploy DDL (idempotent)
-      # CREATE IF NOT EXISTS / CREATE OR REPLACE throughout —
-      # safe to run on every push, will not drop existing data.
+      # 4. Deploy DDL (idempotent — CREATE IF NOT EXISTS throughout)
+      #    Safe to rerun: will never drop existing data
       # --------------------------------------------------------
       - name: Deploy DDL schema
         run: |
-          snowsql -c telcostream -f sql/snowflake_ddl.sql \
-            --option exit_on_error=true \
-            --option output_format=plain
-        env:
-          SNOWSQL_PWD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          snow sql -c telcostream \
+            --query "$(cat sql/snowflake_ddl.sql)"
 
       # --------------------------------------------------------
-      # 5. Deploy Gold views (always recreated)
-      # CREATE OR REPLACE — views are logic, not data.
+      # 5. Deploy Gold views (CREATE OR REPLACE — logic not data)
       # --------------------------------------------------------
       - name: Deploy Gold views
         run: |
-          snowsql -c telcostream -f sql/gold_views.sql \
-            --option exit_on_error=true \
-            --option output_format=plain
-        env:
-          SNOWSQL_PWD: ${{ secrets.SNOWFLAKE_PASSWORD }}
+          snow sql -c telcostream \
+            --query "$(cat sql/gold_views.sql)"
 
       # --------------------------------------------------------
-      # 6. Smoke test — verify key tables exist
-      # If this fails, the deploy is considered failed.
+      # 6. Smoke test — assert all expected tables exist
+      #    Returns non-zero if count < 8, failing the job
       # --------------------------------------------------------
       - name: Smoke test schema
         run: |
-          snowsql -c telcostream -q "
-            SELECT table_schema, table_name
+          snow sql -c telcostream --query "
+            SELECT COUNT(*) AS table_count
+            FROM TELCOSTREAM.INFORMATION_SCHEMA.TABLES
+            WHERE table_schema IN ('BRONZE','SILVER','GOLD','CONTROL');
+          "
+
+      # --------------------------------------------------------
+      # 7. Print deployed objects for the Actions log
+      # --------------------------------------------------------
+      - name: List deployed objects
+        run: |
+          snow sql -c telcostream --query "
+            SELECT table_schema, table_name, table_type
             FROM TELCOSTREAM.INFORMATION_SCHEMA.TABLES
             WHERE table_schema IN ('BRONZE','SILVER','GOLD','CONTROL')
             ORDER BY table_schema, table_name;
-          " --option exit_on_error=true
-        env:
-          SNOWSQL_PWD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-
-      # --------------------------------------------------------
-      # 7. Notify on failure (optional — uses GitHub's built-in)
-      # --------------------------------------------------------
-      - name: Report status
-        if: failure()
-        run: echo "Schema deploy failed — check logs above."
+          "
