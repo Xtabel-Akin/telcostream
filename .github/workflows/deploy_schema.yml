@@ -1,12 +1,7 @@
 # =============================================================
 # TelcoStream — Snowflake Schema Deploy
-# Uses official snowflakedb/snowflake-cli-action@v2 (not SnowSQL)
-# Triggers: push to main (sql/ changes) or manual dispatch
-#
-# Secrets required (GitHub → Settings → Secrets → Actions):
-#   SNOWFLAKE_ACCOUNT    e.g. abc12345.us-east-1
-#   SNOWFLAKE_USER       your Snowflake username
-#   SNOWFLAKE_PASSWORD   your Snowflake password
+# Fix: add config.toml so CLI knows connection "telcostream" exists.
+# Credentials are still injected via GitHub Secrets — never hardcoded.
 # =============================================================
 
 name: Deploy Snowflake Schema
@@ -27,28 +22,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
-    env:
-      # Snowflake CLI reads these env vars automatically
-      # Connection name must match what we use in snow sql -c
-      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
-      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_USER:     ${{ secrets.SNOWFLAKE_USER }}
-      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_ROLE:     ACCOUNTADMIN
-      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_WAREHOUSE: TELCOSTREAM_WH
-      SNOWFLAKE_CONNECTIONS_TELCOSTREAM_DATABASE: TELCOSTREAM
-
     steps:
       # --------------------------------------------------------
-      # 1. Checkout — v4 with Node 24 opt-in to silence warning
+      # 1. Checkout
       # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
-        env:
-          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
       # --------------------------------------------------------
-      # 2. Install Snowflake CLI (official action, replaces SnowSQL)
-      #    v2 installs via uv/pip — no manual binary download
+      # 2. Install Snowflake CLI
       # --------------------------------------------------------
       - name: Install Snowflake CLI
         uses: snowflakedb/snowflake-cli-action@v2
@@ -56,15 +38,32 @@ jobs:
           cli-version: "3.16"
 
       # --------------------------------------------------------
-      # 3. Verify connection before running SQL
-      #    Fails fast here rather than mid-deploy if creds are wrong
+      # 3. Write config.toml
+      # CLI requires this file to know the connection exists.
+      # Secrets are injected here — never stored in the repo.
+      # --------------------------------------------------------
+      - name: Write Snowflake config
+        run: |
+          mkdir -p ~/.snowflake
+          cat > ~/.snowflake/config.toml << TOML
+          [connections.telcostream]
+          account   = "${{ secrets.SNOWFLAKE_ACCOUNT }}"
+          user      = "${{ secrets.SNOWFLAKE_USER }}"
+          password  = "${{ secrets.SNOWFLAKE_PASSWORD }}"
+          role      = "ACCOUNTADMIN"
+          warehouse = "TELCOSTREAM_WH"
+          database  = "TELCOSTREAM"
+          TOML
+          chmod 600 ~/.snowflake/config.toml
+
+      # --------------------------------------------------------
+      # 4. Test connection
       # --------------------------------------------------------
       - name: Test Snowflake connection
         run: snow connection test -c telcostream
 
       # --------------------------------------------------------
-      # 4. Deploy DDL (idempotent — CREATE IF NOT EXISTS throughout)
-      #    Safe to rerun: will never drop existing data
+      # 5. Deploy DDL (idempotent)
       # --------------------------------------------------------
       - name: Deploy DDL schema
         run: |
@@ -72,7 +71,7 @@ jobs:
             --query "$(cat sql/snowflake_ddl.sql)"
 
       # --------------------------------------------------------
-      # 5. Deploy Gold views (CREATE OR REPLACE — logic not data)
+      # 6. Deploy Gold views
       # --------------------------------------------------------
       - name: Deploy Gold views
         run: |
@@ -80,21 +79,9 @@ jobs:
             --query "$(cat sql/gold_views.sql)"
 
       # --------------------------------------------------------
-      # 6. Smoke test — assert all expected tables exist
-      #    Returns non-zero if count < 8, failing the job
+      # 7. Smoke test
       # --------------------------------------------------------
       - name: Smoke test schema
-        run: |
-          snow sql -c telcostream --query "
-            SELECT COUNT(*) AS table_count
-            FROM TELCOSTREAM.INFORMATION_SCHEMA.TABLES
-            WHERE table_schema IN ('BRONZE','SILVER','GOLD','CONTROL');
-          "
-
-      # --------------------------------------------------------
-      # 7. Print deployed objects for the Actions log
-      # --------------------------------------------------------
-      - name: List deployed objects
         run: |
           snow sql -c telcostream --query "
             SELECT table_schema, table_name, table_type
