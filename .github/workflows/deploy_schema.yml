@@ -1,7 +1,7 @@
 # =============================================================
 # TelcoStream — Snowflake Schema Deploy
-# Fix: write config.toml via Python to safely handle special
-# characters in passwords (heredoc approach breaks on @#$% etc)
+# Fix: remove database from connection config so connection test
+# passes before the database exists. DDL step creates it.
 # =============================================================
 
 name: Deploy Snowflake Schema
@@ -32,9 +32,8 @@ jobs:
           cli-version: "3.16"
 
       # --------------------------------------------------------
-      # Write config.toml via Python — safely handles any special
-      # characters in passwords. Secrets passed as env vars,
-      # never interpolated directly into shell or TOML strings.
+      # No database in config — DDL creates it.
+      # Warehouse also omitted here; DDL creates it too.
       # --------------------------------------------------------
       - name: Write Snowflake config
         env:
@@ -47,14 +46,12 @@ jobs:
           import os, pathlib
 
           config = f"""
-          [connections.telcostream]
-          account   = {os.environ['SF_ACCOUNT']!r}
-          user      = {os.environ['SF_USER']!r}
-          password  = {os.environ['SF_PASSWORD']!r}
-          role      = "ACCOUNTADMIN"
-          warehouse = "TELCOSTREAM_WH"
-          database  = "TELCOSTREAM"
-          """
+[connections.telcostream]
+account = {os.environ['SF_ACCOUNT']!r}
+user    = {os.environ['SF_USER']!r}
+password = {os.environ['SF_PASSWORD']!r}
+role    = "ACCOUNTADMIN"
+"""
 
           p = pathlib.Path.home() / ".snowflake" / "config.toml"
           p.write_text(config.strip())
@@ -65,6 +62,10 @@ jobs:
       - name: Test Snowflake connection
         run: snow connection test -c telcostream
 
+      # --------------------------------------------------------
+      # DDL creates the database, schemas, warehouse, and tables.
+      # All subsequent steps can reference TELCOSTREAM safely.
+      # --------------------------------------------------------
       - name: Deploy DDL schema
         run: |
           snow sql -c telcostream \
