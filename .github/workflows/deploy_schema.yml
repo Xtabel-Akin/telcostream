@@ -1,7 +1,7 @@
 # =============================================================
 # TelcoStream — Snowflake Schema Deploy
-# Fix: add config.toml so CLI knows connection "telcostream" exists.
-# Credentials are still injected via GitHub Secrets — never hardcoded.
+# Fix: write config.toml via Python to safely handle special
+# characters in passwords (heredoc approach breaks on @#$% etc)
 # =============================================================
 
 name: Deploy Snowflake Schema
@@ -23,64 +23,58 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      # --------------------------------------------------------
-      # 1. Checkout
-      # --------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --------------------------------------------------------
-      # 2. Install Snowflake CLI
-      # --------------------------------------------------------
       - name: Install Snowflake CLI
         uses: snowflakedb/snowflake-cli-action@v2
         with:
           cli-version: "3.16"
 
       # --------------------------------------------------------
-      # 3. Write config.toml
-      # CLI requires this file to know the connection exists.
-      # Secrets are injected here — never stored in the repo.
+      # Write config.toml via Python — safely handles any special
+      # characters in passwords. Secrets passed as env vars,
+      # never interpolated directly into shell or TOML strings.
       # --------------------------------------------------------
       - name: Write Snowflake config
+        env:
+          SF_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SF_USER:     ${{ secrets.SNOWFLAKE_USER }}
+          SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
         run: |
           mkdir -p ~/.snowflake
-          cat > ~/.snowflake/config.toml << TOML
+          python3 - << 'PYEOF'
+          import os, pathlib
+
+          config = f"""
           [connections.telcostream]
-          account   = "${{ secrets.SNOWFLAKE_ACCOUNT }}"
-          user      = "${{ secrets.SNOWFLAKE_USER }}"
-          password  = "${{ secrets.SNOWFLAKE_PASSWORD }}"
+          account   = {os.environ['SF_ACCOUNT']!r}
+          user      = {os.environ['SF_USER']!r}
+          password  = {os.environ['SF_PASSWORD']!r}
           role      = "ACCOUNTADMIN"
           warehouse = "TELCOSTREAM_WH"
           database  = "TELCOSTREAM"
-          TOML
-          chmod 600 ~/.snowflake/config.toml
+          """
 
-      # --------------------------------------------------------
-      # 4. Test connection
-      # --------------------------------------------------------
+          p = pathlib.Path.home() / ".snowflake" / "config.toml"
+          p.write_text(config.strip())
+          p.chmod(0o600)
+          print("config.toml written successfully")
+          PYEOF
+
       - name: Test Snowflake connection
         run: snow connection test -c telcostream
 
-      # --------------------------------------------------------
-      # 5. Deploy DDL (idempotent)
-      # --------------------------------------------------------
       - name: Deploy DDL schema
         run: |
           snow sql -c telcostream \
             --query "$(cat sql/snowflake_ddl.sql)"
 
-      # --------------------------------------------------------
-      # 6. Deploy Gold views
-      # --------------------------------------------------------
       - name: Deploy Gold views
         run: |
           snow sql -c telcostream \
             --query "$(cat sql/gold_views.sql)"
 
-      # --------------------------------------------------------
-      # 7. Smoke test
-      # --------------------------------------------------------
       - name: Smoke test schema
         run: |
           snow sql -c telcostream --query "
