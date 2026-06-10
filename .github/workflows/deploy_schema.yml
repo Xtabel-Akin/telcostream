@@ -1,9 +1,3 @@
-# =============================================================
-# TelcoStream — Snowflake Schema Deploy
-# Fix: remove database from connection config so connection test
-# passes before the database exists. DDL step creates it.
-# =============================================================
-
 name: Deploy Snowflake Schema
 
 on:
@@ -31,50 +25,21 @@ jobs:
         with:
           cli-version: "3.16"
 
-      # --------------------------------------------------------
-      # No database in config — DDL creates it.
-      # Warehouse also omitted here; DDL creates it too.
-      # --------------------------------------------------------
       - name: Write Snowflake config
         env:
-          SF_ACCOUNT:  ${{ secrets.SNOWFLAKE_ACCOUNT }}
-          SF_USER:     ${{ secrets.SNOWFLAKE_USER }}
+          SF_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SF_USER: ${{ secrets.SNOWFLAKE_USER }}
           SF_PASSWORD: ${{ secrets.SNOWFLAKE_PASSWORD }}
-        run: |
-          mkdir -p ~/.snowflake
-          python3 - << 'PYEOF'
-          import os, pathlib
-
-          config = f"""
-[connections.telcostream]
-account = {os.environ['SF_ACCOUNT']!r}
-user    = {os.environ['SF_USER']!r}
-password = {os.environ['SF_PASSWORD']!r}
-role    = "ACCOUNTADMIN"
-"""
-
-          p = pathlib.Path.home() / ".snowflake" / "config.toml"
-          p.write_text(config.strip())
-          p.chmod(0o600)
-          print("config.toml written successfully")
-          PYEOF
+        run: python3 scripts/write_snowflake_config.py
 
       - name: Test Snowflake connection
         run: snow connection test -c telcostream
 
-      # --------------------------------------------------------
-      # DDL creates the database, schemas, warehouse, and tables.
-      # All subsequent steps can reference TELCOSTREAM safely.
-      # --------------------------------------------------------
       - name: Deploy DDL schema
-        run: |
-          snow sql -c telcostream \
-            --query "$(cat sql/snowflake_ddl.sql)"
+        run: snow sql -c telcostream --query "$(cat sql/snowflake_ddl.sql)"
 
       - name: Deploy Gold views
-        run: |
-          snow sql -c telcostream \
-            --query "$(cat sql/gold_views.sql)"
+        run: snow sql -c telcostream --query "$(cat sql/gold_views.sql)"
 
       - name: Smoke test schema
         run: |
@@ -82,5 +47,4 @@ role    = "ACCOUNTADMIN"
             SELECT table_schema, table_name, table_type
             FROM TELCOSTREAM.INFORMATION_SCHEMA.TABLES
             WHERE table_schema IN ('BRONZE','SILVER','GOLD','CONTROL')
-            ORDER BY table_schema, table_name;
-          "
+            ORDER BY table_schema, table_name;"
